@@ -8,9 +8,9 @@ import (
 	"testing"
 
 	"github.com/micro/go-micro/client"
+	"github.com/micro/go-micro/client/selector"
 	"github.com/micro/go-micro/registry"
 	"github.com/micro/go-micro/registry/memory"
-	"github.com/micro/go-micro/selector"
 	pgrpc "google.golang.org/grpc"
 	pb "google.golang.org/grpc/examples/helloworld/helloworld"
 )
@@ -45,7 +45,7 @@ func TestGRPCClient(t *testing.T) {
 
 	// register service
 	r.Register(&registry.Service{
-		Name:    "test",
+		Name:    "helloworld",
 		Version: "test",
 		Nodes: []*registry.Node{
 			&registry.Node{
@@ -73,7 +73,7 @@ func TestGRPCClient(t *testing.T) {
 	}
 
 	for _, method := range testMethods {
-		req := c.NewRequest("test", method, &pb.HelloRequest{
+		req := c.NewRequest("helloworld", method, &pb.HelloRequest{
 			Name: "John",
 		})
 

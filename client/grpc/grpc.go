@@ -12,11 +12,11 @@ import (
 
 	"github.com/micro/go-micro/broker"
 	"github.com/micro/go-micro/client"
+	"github.com/micro/go-micro/client/selector"
 	"github.com/micro/go-micro/codec"
 	"github.com/micro/go-micro/errors"
 	"github.com/micro/go-micro/metadata"
 	"github.com/micro/go-micro/registry"
-	"github.com/micro/go-micro/selector"
 	"github.com/micro/go-micro/transport"
 
 	"google.golang.org/grpc"
@@ -32,8 +32,9 @@ type grpcClient struct {
 }
 
 func init() {
-	encoding.RegisterCodec(jsonCodec{})
-	encoding.RegisterCodec(bytesCodec{})
+	encoding.RegisterCodec(wrapCodec{jsonCodec{}})
+	encoding.RegisterCodec(wrapCodec{protoCodec{}})
+	encoding.RegisterCodec(wrapCodec{bytesCodec{}})
 }
 
 // secure returns the dial option for whether its a secure or insecure connection
@@ -58,14 +59,14 @@ func (g *grpcClient) next(request client.Request, opts client.CallOptions) (sele
 
 	// get proxy address
 	if prx := os.Getenv("MICRO_PROXY_ADDRESS"); len(prx) > 0 {
-		opts.Address = prx
+		opts.Address = []string{prx}
 	}
 
 	// return remote address
 	if len(opts.Address) > 0 {
 		return func() (*registry.Node, error) {
 			return &registry.Node{
-				Address: opts.Address,
+				Address: opts.Address[0],
 			}, nil
 		}, nil
 	}
@@ -129,7 +130,7 @@ func (g *grpcClient) call(ctx context.Context, node *registry.Node, req client.R
 	ch := make(chan error, 1)
 
 	go func() {
-		err := cc.Invoke(ctx, methodToGRPC(req.Endpoint(), req.Body()), req.Body(), rsp, grpc.ForceCodec(cf))
+		err := cc.Invoke(ctx, methodToGRPC(req.Service(), req.Endpoint()), req.Body(), rsp, grpc.ForceCodec(cf))
 		ch <- microError(err)
 	}()
 
@@ -177,7 +178,10 @@ func (g *grpcClient) stream(ctx context.Context, node *registry.Node, req client
 		dialCtx, cancel = context.WithCancel(ctx)
 	}
 	defer cancel()
-	cc, err := grpc.DialContext(dialCtx, address, grpc.WithDefaultCallOptions(grpc.ForceCodec(cf)), g.secure())
+
+	wc := wrapCodec{cf}
+
+	cc, err := grpc.DialContext(dialCtx, address, grpc.WithDefaultCallOptions(grpc.ForceCodec(wc)), g.secure())
 	if err != nil {
 		return nil, errors.InternalServerError("go.micro.client", fmt.Sprintf("Error sending request: %v", err))
 	}
@@ -188,15 +192,26 @@ func (g *grpcClient) stream(ctx context.Context, node *registry.Node, req client
 		ServerStreams: true,
 	}
 
-	st, err := cc.NewStream(ctx, desc, methodToGRPC(req.Endpoint(), req.Body()))
+	st, err := cc.NewStream(ctx, desc, methodToGRPC(req.Service(), req.Endpoint()))
 	if err != nil {
 		return nil, errors.InternalServerError("go.micro.client", fmt.Sprintf("Error creating stream: %v", err))
+	}
+
+	codec := &grpcCodec{
+		s: st,
+		c: wc,
+	}
+
+	// set request codec
+	if r, ok := req.(*grpcRequest); ok {
+		r.codec = codec
 	}
 
 	rsp := &response{
 		conn:   cc,
 		stream: st,
 		codec:  cf,
+		gcodec: codec,
 	}
 
 	return &grpcStream{
@@ -280,7 +295,7 @@ func (g *grpcClient) Options() client.Options {
 }
 
 func (g *grpcClient) NewMessage(topic string, msg interface{}, opts ...client.MessageOption) client.Message {
-	return newGRPCPublication(topic, msg, "application/octet-stream")
+	return newGRPCPublication(topic, msg, g.opts.ContentType, opts...)
 }
 
 func (g *grpcClient) NewRequest(service, method string, req interface{}, reqOpts ...client.RequestOption) client.Request {
@@ -357,9 +372,9 @@ func (g *grpcClient) Call(ctx context.Context, req client.Request, rsp interface
 	var gerr error
 
 	for i := 0; i <= callOpts.Retries; i++ {
-		go func() {
+		go func(i int) {
 			ch <- call(i)
-		}()
+		}(i)
 
 		select {
 		case <-ctx.Done():
@@ -440,10 +455,10 @@ func (g *grpcClient) Stream(ctx context.Context, req client.Request, opts ...cli
 	var grr error
 
 	for i := 0; i <= callOpts.Retries; i++ {
-		go func() {
+		go func(i int) {
 			s, err := call(i)
 			ch <- response{s, err}
-		}()
+		}(i)
 
 		select {
 		case <-ctx.Done():
